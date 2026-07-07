@@ -21,6 +21,36 @@ The command to build:
 just release
 ```
 
+## A100 / CUDA 12.6 可迁移镜像
+
+如果要把 A100 + CUDA 12.6 / cu126 环境打成可迁移 Docker 镜像，可以使用专用 Dockerfile：
+
+```bash
+bash docker/build_a100_cu126.sh
+```
+
+默认镜像名是 `slime:a100-cu126`。可以通过环境变量覆盖：
+
+```bash
+IMAGE_TAG=my-slime:a100-cu126 MAX_JOBS=16 bash docker/build_a100_cu126.sh
+```
+
+如果需要把镜像迁移到另一台机器，可以导出和导入：
+
+```bash
+docker save slime:a100-cu126 -o slime_a100_cu126.tar
+docker load -i slime_a100_cu126.tar
+```
+
+镜像构建阶段通常没有 GPU，因此不会执行运行时验证。把镜像迁移到 A100 机器后，用下面命令验证：
+
+```bash
+docker run --rm --gpus all --ipc=host --shm-size=16g \
+  slime:a100-cu126 verify-a100-cu126
+```
+
+验证会检查 PyTorch CUDA 版本是否为 12.6、是否检测到 A100 / SM80、关键环境变量是否正确，以及 `slime`、`sglang`、`sglang_router`、`transformer_engine`、`deep_ep`、`megatron` 是否能正常导入。
+
 Before each update, we will test the following models with 64xH100:
 
 - Qwen3-4B sync

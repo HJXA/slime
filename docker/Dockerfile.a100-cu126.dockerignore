@@ -1,0 +1,7 @@
+# 只发送 A100/cu126 镜像构建需要的脚本，避免把数据、模型、日志和 .git 一起打进 build context。
+**
+!build_conda_a100_cu126_user.sh
+!docker/
+!docker/Dockerfile.a100-cu126
+!docker/Dockerfile.a100-cu126.dockerignore
+!docker/verify_a100_cu126.sh

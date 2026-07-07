@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1
+
+ARG CUDA_IMAGE=nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+FROM ${CUDA_IMAGE}
+
+ARG APP_USER=slime
+ARG APP_UID=1000
+ARG APP_GID=1000
+ARG BASE_DIR=/home/slime/slime_a100_cu126
+ARG ENV_NAME=slime-a100-cu126
+ARG PATCH_VERSION=v0.5.9.a100
+ARG SLIME_A100_REPO=https://github.com/jason9693/slime-a100.git
+ARG SLIME_A100_REF=main
+ARG MAX_JOBS=32
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 安装构建依赖；Docker 镜像里只做系统依赖，Python/CUDA 运行环境交给构建脚本统一管理。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git git-lfs curl wget ca-certificates \
+    build-essential gcc g++ make \
+    cmake ninja-build pkg-config patch rsync \
+    python3 python3-dev cargo bzip2 tar \
+    libaio-dev numactl \
+  && rm -rf /var/lib/apt/lists/*
+
+# 创建非 root 用户，让 slime、micromamba、conda env 和源码都落在用户 HOME 下。
+# GID 在宿主机和 Ubuntu 基础镜像中可能重名；直接复用已有 GID 可以避免迁移构建失败。
+RUN if ! getent group "${APP_GID}" >/dev/null; then \
+      groupadd --gid "${APP_GID}" "${APP_USER}"; \
+    fi \
+  && if id -u "${APP_UID}" >/dev/null 2>&1; then \
+      echo "[错误] UID ${APP_UID} 已存在，请覆盖 APP_UID 后重新构建。" >&2; \
+      exit 1; \
+    fi \
+  && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /bin/bash "${APP_USER}"
+
+COPY --chown=${APP_UID}:${APP_GID} build_conda_a100_cu126_user.sh /tmp/build_conda_a100_cu126_user.sh
+COPY docker/verify_a100_cu126.sh /usr/local/bin/verify-a100-cu126
+RUN chmod +x /tmp/build_conda_a100_cu126_user.sh /usr/local/bin/verify-a100-cu126
+
+USER ${APP_USER}
+WORKDIR /home/${APP_USER}
+
+# Docker build 阶段通常没有 GPU，因此只构建环境，不执行 A100/CUDA 运行时验证。
+RUN BASE_DIR=${BASE_DIR} \
+    ENV_NAME=${ENV_NAME} \
+    PATCH_VERSION=${PATCH_VERSION} \
+    SLIME_A100_REPO=${SLIME_A100_REPO} \
+    SLIME_A100_REF=${SLIME_A100_REF} \
+    REUSE_ROOT_EXISTING=0 \
+    TORCH_CUDA_ARCH_LIST=8.0 \
+    CUDA_DEVICE_MAX_CONNECTIONS=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    SLIME_FAST_CLEAR_MEMORY=1 \
+    NCCL_NVLS_ENABLE=0 \
+    MAX_JOBS=${MAX_JOBS} \
+    bash /tmp/build_conda_a100_cu126_user.sh --no-verify
+
+ENV BASE_DIR=${BASE_DIR}
+ENV ENV_NAME=${ENV_NAME}
+ENV MAMBA_ROOT_PREFIX=${BASE_DIR}/micromamba
+ENV CUDA_HOME=${BASE_DIR}/micromamba/envs/${ENV_NAME}
+ENV SLIME_ROOT=${BASE_DIR}/slime-a100
+ENV PYTHONPATH=${BASE_DIR}/Megatron-LM
+ENV TORCH_CUDA_ARCH_LIST=8.0
+ENV CUDA_DEVICE_MAX_CONNECTIONS=1
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ENV SLIME_FAST_CLEAR_MEMORY=1
+ENV NCCL_NVLS_ENABLE=0
+ENV PATH=${BASE_DIR}/micromamba/envs/${ENV_NAME}/bin:${BASE_DIR}/bin:${PATH}
+
+RUN printf '%s\n' \
+  "source ${BASE_DIR}/activate_slime_a100_cu126.sh" \
+  "cd ${SLIME_ROOT}" \
+  >> /home/${APP_USER}/.bashrc
+
+CMD ["/bin/bash"]
