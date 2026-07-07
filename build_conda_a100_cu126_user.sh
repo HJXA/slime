@@ -28,6 +28,9 @@ usage() {
   --prepare-only     只克隆 A100 fork 并生成 cu126/user-home 构建脚本，不执行构建
   --update-repo      如果 A100 fork 已存在，则 fetch 后切到 SLIME_A100_REF
   --no-verify        构建完成后不运行 Python 导入验证
+  --force-build      即使构建完成标识已存在，也重新执行构建阶段
+  --force-verify     即使验证完成标识已存在，也重新执行验证阶段
+  --reset-resume     清空断点标识后重新判断各阶段
   -h, --help         显示本说明
 
 可覆盖环境变量:
@@ -42,6 +45,10 @@ usage() {
   ROOT_BASE_DIR      默认 /root；用于查找可复用的系统级资源
   INSTALL_LOG        默认 ${BASE_DIR}/install_a100_cu126_<时间戳>.log
   BUILD_LOG          默认 ${BASE_DIR}/build_cuda126.log
+  RESUME_DIR         默认 ${BASE_DIR}/.resume_a100_cu126
+  RESUME_ENABLED     默认 1；设为 0 时忽略断点标识
+  RETRY_ATTEMPTS     默认 5；GitHub pip 安装失败时的最大重试次数
+  RETRY_DELAY_SECONDS 默认 30；每次重试前等待秒数
 
 示例:
   bash build_conda_a100_cu126_user.sh
@@ -53,6 +60,9 @@ USAGE
 RUN_BUILD=1
 UPDATE_REPO=0
 RUN_VERIFY=1
+FORCE_BUILD=0
+FORCE_VERIFY=0
+RESET_RESUME=0
 
 # 解析命令行选项，默认直接构建，按需只生成脚本或跳过验证。
 while [ "$#" -gt 0 ]; do
@@ -68,6 +78,18 @@ while [ "$#" -gt 0 ]; do
       ;;
     --no-verify)
       RUN_VERIFY=0
+      shift
+      ;;
+    --force-build)
+      FORCE_BUILD=1
+      shift
+      ;;
+    --force-verify)
+      FORCE_VERIFY=1
+      shift
+      ;;
+    --reset-resume)
+      RESET_RESUME=1
       shift
       ;;
     -h|--help)
@@ -96,6 +118,8 @@ MAX_JOBS="${MAX_JOBS:-32}"
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
 REUSE_ROOT_EXISTING="${REUSE_ROOT_EXISTING:-1}"
 ROOT_BASE_DIR="${ROOT_BASE_DIR:-/root}"
+RETRY_ATTEMPTS="${RETRY_ATTEMPTS:-5}"
+RETRY_DELAY_SECONDS="${RETRY_DELAY_SECONDS:-30}"
 
 # 解析 BASE_DIR 的真实路径，并强制默认位于当前用户 HOME 下。
 mkdir -p "${BASE_DIR_INPUT}"
@@ -125,6 +149,8 @@ GENERATED_SCRIPT="${GENERATED_SCRIPT:-${SLIME_DIR}/build_conda.a100.cuda126.user
 ACTIVATE_FILE="${ACTIVATE_FILE:-${BASE_DIR}/activate_slime_a100_cu126.sh}"
 BUILD_LOG="${BUILD_LOG:-${BASE_DIR}/build_cuda126.log}"
 INSTALL_LOG="${INSTALL_LOG:-${BASE_DIR}/install_a100_cu126_$(date +%Y%m%d_%H%M%S).log}"
+RESUME_DIR="${RESUME_DIR:-${BASE_DIR}/.resume_a100_cu126}"
+RESUME_ENABLED="${RESUME_ENABLED:-1}"
 
 export BASE_DIR
 export ENV_NAME
@@ -133,11 +159,65 @@ export TORCH_CUDA_ARCH_LIST
 export MAX_JOBS
 export MAMBA_ROOT_PREFIX
 export MAMBA_EXE
+export RESUME_DIR
+export RESUME_ENABLED
+export RETRY_ATTEMPTS
+export RETRY_DELAY_SECONDS
 
 # 从这里开始记录完整安装过程：既实时打印到终端，也写入总日志文件。
 touch "${INSTALL_LOG}" || die "无法写入安装日志：${INSTALL_LOG}"
 exec > >(tee -a "${INSTALL_LOG}") 2>&1
 trap 'status=$?; if [ "${status}" -ne 0 ]; then printf "[错误] 脚本异常退出，退出码=%s；请查看安装日志：%s\n" "${status}" "${INSTALL_LOG}" >&2; fi' EXIT
+
+# 返回阶段完成标识文件路径；阶段名只在脚本内部生成，避免用户输入污染路径。
+stage_marker() {
+  local stage="$1"
+  printf '%s/%s.done\n' "${RESUME_DIR}" "${stage}"
+}
+
+# 判断阶段是否已经完成；只有显式完成标识存在时才允许跳过。
+stage_done() {
+  local stage="$1"
+  [ "${RESUME_ENABLED}" = "1" ] && [ -f "$(stage_marker "${stage}")" ]
+}
+
+# 阶段成功后写入完成标识；失败、中断或半成品都不会写这个文件。
+mark_stage_done() {
+  local stage="$1"
+  local marker
+  marker="$(stage_marker "${stage}")"
+  if [ "${RESUME_ENABLED}" = "1" ]; then
+    mkdir -p "${RESUME_DIR}"
+    {
+      printf 'stage=%s\n' "${stage}"
+      printf 'completed_at=%s\n' "$(date +%Y%m%d_%H%M%S)"
+      printf 'base_dir=%s\n' "${BASE_DIR}"
+      printf 'env_name=%s\n' "${ENV_NAME}"
+      printf 'patch_version=%s\n' "${PATCH_VERSION}"
+    } > "${marker}"
+  fi
+}
+
+# 强制重跑某个阶段前清理对应标识，避免旧验证结果覆盖新构建结果。
+clear_stage_done() {
+  local stage="$1"
+  if [ "${RESUME_ENABLED}" = "1" ]; then
+    rm -f "$(stage_marker "${stage}")"
+  fi
+}
+
+# 清空断点标识只允许发生在 BASE_DIR 下，避免误删用户传入的任意目录。
+if [ "${RESET_RESUME}" = "1" ]; then
+  case "${RESUME_DIR}" in
+    "${BASE_DIR}"/*)
+      rm -rf "${RESUME_DIR}"
+      ;;
+    *)
+      die "RESUME_DIR=${RESUME_DIR} 不在 BASE_DIR=${BASE_DIR} 下，拒绝执行 --reset-resume。"
+      ;;
+  esac
+fi
+mkdir -p "${RESUME_DIR}"
 
 log "BASE_DIR=${BASE_DIR}"
 log "SLIME_DIR=${SLIME_DIR}"
@@ -145,8 +225,16 @@ log "ENV_NAME=${ENV_NAME}"
 log "PATCH_VERSION=${PATCH_VERSION}"
 log "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
 log "REUSE_ROOT_EXISTING=${REUSE_ROOT_EXISTING}"
+log "RETRY_ATTEMPTS=${RETRY_ATTEMPTS}"
+log "RETRY_DELAY_SECONDS=${RETRY_DELAY_SECONDS}"
+log "RESUME_ENABLED=${RESUME_ENABLED}"
+log "RESUME_DIR=${RESUME_DIR}"
 log "INSTALL_LOG=${INSTALL_LOG}"
 log "BUILD_LOG=${BUILD_LOG}"
+
+PREPARE_STAGE="prepare_${ENV_NAME}_${PATCH_VERSION}"
+BUILD_STAGE="build_${ENV_NAME}_${PATCH_VERSION}"
+VERIFY_STAGE="verify_${ENV_NAME}_${PATCH_VERSION}"
 
 # A100 是 SM80；这里给出提醒，不强制检查 GPU，方便在登录节点先生成脚本。
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -283,6 +371,10 @@ env_name = os.environ["ENV_NAME"]
 patch_version = os.environ["PATCH_VERSION"]
 mamba_root = os.environ["MAMBA_ROOT_PREFIX"]
 mamba_exe = os.environ["MAMBA_EXE"]
+resume_dir = os.environ["RESUME_DIR"]
+resume_enabled = os.environ["RESUME_ENABLED"]
+retry_attempts = os.environ["RETRY_ATTEMPTS"]
+retry_delay_seconds = os.environ["RETRY_DELAY_SECONDS"]
 
 # 将旧脚本中的系统级用户目录前缀统一改为当前用户的 BASE_DIR。
 old_root = "/" + "root"
@@ -349,9 +441,141 @@ export PYTORCH_CUDA_ALLOC_CONF="${{PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:
 export SLIME_FAST_CLEAR_MEMORY="${{SLIME_FAST_CLEAR_MEMORY:-1}}"
 export NCCL_NVLS_ENABLE="${{NCCL_NVLS_ENABLE:-0}}"
 export MAX_JOBS="${{MAX_JOBS:-32}}"
+export RESUME_DIR="${{RESUME_DIR:-{resume_dir}}}"
+export RESUME_ENABLED="${{RESUME_ENABLED:-{resume_enabled}}}"
+export GENERATED_RESUME_DIR="${{RESUME_DIR}}/generated"
+export RETRY_ATTEMPTS="${{RETRY_ATTEMPTS:-{retry_attempts}}}"
+export RETRY_DELAY_SECONDS="${{RETRY_DELAY_SECONDS:-{retry_delay_seconds}}}"
+export GIT_CONFIG_COUNT="${{GIT_CONFIG_COUNT:-1}}"
+export GIT_CONFIG_KEY_0="${{GIT_CONFIG_KEY_0:-http.version}}"
+export GIT_CONFIG_VALUE_0="${{GIT_CONFIG_VALUE_0:-HTTP/1.1}}"
+mkdir -p "${{GENERATED_RESUME_DIR}}"
+
+# 返回生成脚本内部步骤的完成标识路径。
+generated_stage_marker() {{
+  local stage="$1"
+  printf '%s/%s.done\\n' "${{GENERATED_RESUME_DIR}}" "${{stage}}"
+}}
+
+# 成功步骤会写完成标识；重跑时只跳过这些明确完成过的步骤。
+mark_generated_stage_done() {{
+  local stage="$1"
+  if [ "${{RESUME_ENABLED}}" = "1" ]; then
+    printf 'stage=%s\\ncompleted_at=%s\\n' "${{stage}}" "$(date +%Y%m%d_%H%M%S)" > "$(generated_stage_marker "${{stage}}")"
+  fi
+}}
+
+# 执行一个可断点续跑步骤；失败不会写标识，下一次重跑会继续尝试。
+run_generated_step() {{
+  local stage="$1"
+  local status=0
+  shift
+
+  # 只有明确完成的步骤才能跳过，目录存在但没有标识不会被误判为成功。
+  if [ "${{RESUME_ENABLED}}" = "1" ] && [ -f "$(generated_stage_marker "${{stage}}")" ]; then
+    echo "[信息] 跳过已完成步骤：${{stage}}"
+    return 0
+  fi
+
+  # 命令成功后立即写标识，网络中断或编译失败时保留原始失败码。
+  if "$@"; then
+    mark_generated_stage_done "${{stage}}"
+    return 0
+  else
+    status="$?"
+    return "${{status}}"
+  fi
+}}
+
+# 对 GitHub 源码安装加重试，降低集群网络/TLS 短断导致整轮构建失败的概率。
+retry_command() {{
+  local attempt=1
+  local status=0
+
+  # 循环执行同一命令；例如 `pip install git+https://github.com/x/y.git@sha --no-deps` 失败后会等待再试。
+  while true; do
+    "$@" && return 0
+    status="$?"
+
+    # 达到最大次数后保留原始退出码，方便日志定位真实失败命令。
+    if [ "${{attempt}}" -ge "${{RETRY_ATTEMPTS}}" ]; then
+      echo "[错误] 命令重试 ${{RETRY_ATTEMPTS}} 次后仍失败：$*" >&2
+      return "${{status}}"
+    fi
+
+    echo "[警告] 命令失败，${{RETRY_DELAY_SECONDS}} 秒后重试 $((attempt + 1))/${{RETRY_ATTEMPTS}}：$*" >&2
+    sleep "${{RETRY_DELAY_SECONDS}}"
+    attempt="$((attempt + 1))"
+  done
+}}
 '''
 if marker not in text:
     text = text.replace("set -ex", injected, 1)
+
+# 克隆命令改为可重入：已有仓库时复用目录，缺失时才重新拉取。
+text = text.replace(
+    "git clone https://github.com/sgl-project/sglang.git",
+    'if [ -d sglang/.git ]; then echo "[信息] 复用已有 sglang 仓库"; mark_generated_stage_done clone_sglang; else run_generated_step clone_sglang retry_command git clone https://github.com/sgl-project/sglang.git; fi',
+)
+text = text.replace(
+    "git clone https://github.com/deepseek-ai/DeepEP.git",
+    'if [ -d DeepEP/.git ]; then echo "[信息] 复用已有 DeepEP 仓库"; mark_generated_stage_done clone_deepep; else run_generated_step clone_deepep retry_command git clone https://github.com/deepseek-ai/DeepEP.git; fi',
+)
+
+# Megatron 原脚本把 clone/checkout/install 串在一起；拆开后才能在已有目录上继续执行。
+text = re.sub(
+    r"git clone https://github\.com/NVIDIA/Megatron-LM\.git --recursive\s*&&\s*\\?\s*cd Megatron-LM/\s*&&\s*git checkout \${MEGATRON_COMMIT}\s*&&\s*\\?\s*pip install -e \.",
+    'if [ -d Megatron-LM/.git ]; then echo "[信息] 复用已有 Megatron-LM 仓库"; mark_generated_stage_done clone_megatron; else run_generated_step clone_megatron retry_command git clone https://github.com/NVIDIA/Megatron-LM.git --recursive; fi\ncd Megatron-LM/\ngit checkout -f ${MEGATRON_COMMIT}\ngit submodule update --init --recursive\nrun_generated_step pip_megatron_editable pip install -e .',
+    text,
+)
+
+# 第三方仓库可能已经打过 patch；重跑时先回到固定 commit，再由后续 patch 步骤重新应用。
+text = text.replace("git checkout ${SGLANG_COMMIT}", "git checkout -f ${SGLANG_COMMIT}")
+text = text.replace("git checkout ${DEEPEP_COMMIT}", "git checkout -f ${DEEPEP_COMMIT}")
+text = text.replace("git checkout ${MEGATRON_COMMIT}", "git checkout -f ${MEGATRON_COMMIT}")
+
+# 用户态安装不能写 /etc/profile.d；运行时统一使用外层生成的 activate 脚本。
+text = re.sub(r"SLIME_ENV_SH=/etc/profile\.d/slime_env\.sh", 'SLIME_ENV_SH="${BASE_DIR}/slime_env.sh"', text)
+text = re.sub(r'RC_FILES="[^"]*"', 'RC_FILES="${BASE_DIR}/.bashrc"', text)
+
+# 将 GitHub 源码 pip 安装改为“断点步骤 + 重试”版本。
+def github_pip_stage(command: str) -> str:
+    """把 pip GitHub 安装命令转成稳定的阶段名。"""
+    key = re.sub(r"[^A-Za-z0-9]+", "_", command).strip("_").lower()
+    return "pip_github_" + key[:96]
+
+
+def wrap_github_pip(match: re.Match[str]) -> str:
+    """把 `pip install git+https://github.com/...` 包成可重试、可跳过步骤。"""
+    indent = match.group(1)
+    command = match.group(2)
+    return f"{indent}run_generated_step {github_pip_stage(command)} retry_command {command}"
+
+
+text = re.sub(
+    r"(?m)^(\s*)(pip install git\+https://github\.com/[^\n]+)$",
+    wrap_github_pip,
+    text,
+)
+text = re.sub(
+    r"(?m)^(\s*)(python -m pip install git\+https://github\.com/[^\n]+)$",
+    wrap_github_pip,
+    text,
+)
+
+# 常见重型 wheel/源码安装也写步骤标识，避免一次成功后下一次续跑重复构建。
+text = text.replace(
+    "MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation",
+    'run_generated_step pip_flash_attn env MAX_JOBS="${MAX_JOBS:-64}" pip -v install flash-attn==2.7.4.post1 --no-build-isolation',
+)
+text = text.replace(
+    'pip install --no-build-isolation "transformer_engine[pytorch]==2.10.0"',
+    'run_generated_step pip_transformer_engine pip install --no-build-isolation "transformer_engine[pytorch]==2.10.0"',
+)
+text = text.replace(
+    "pip install cmake ninja",
+    "run_generated_step pip_cmake_ninja pip install cmake ninja",
+)
 
 path.write_text(text)
 PY
@@ -379,43 +603,65 @@ export NCCL_NVLS_ENABLE=0
 EOF
 chmod +x "${ACTIVATE_FILE}"
 log "已生成激活脚本：${ACTIVATE_FILE}"
+mark_stage_done "${PREPARE_STAGE}"
 
 # 默认执行构建；prepare-only 模式只生成脚本，方便用户先审查。
 if [ "${RUN_BUILD}" = "1" ]; then
-  log "开始执行 A100/CU126 构建，日志写入 ${BUILD_LOG}"
-  (
-    cd "${SLIME_DIR}"
-    BASE_DIR="${BASE_DIR}" \
-    PATCH_VERSION="${PATCH_VERSION}" \
-    MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX}" \
-    TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
-    CUDA_DEVICE_MAX_CONNECTIONS=1 \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    SLIME_FAST_CLEAR_MEMORY=1 \
-    NCCL_NVLS_ENABLE=0 \
-    MAX_JOBS="${MAX_JOBS}" \
-    bash "${GENERATED_SCRIPT}"
-  ) 2>&1 | tee "${BUILD_LOG}"
+  # 只有构建阶段明确完成过，且用户没有要求强制重跑时，才跳过这段长构建。
+  if stage_done "${BUILD_STAGE}" && [ "${FORCE_BUILD}" != "1" ]; then
+    log "检测到构建完成标识，跳过构建阶段：$(stage_marker "${BUILD_STAGE}")"
+  else
+    log "开始执行 A100/CU126 构建，日志追加写入 ${BUILD_LOG}"
+    clear_stage_done "${BUILD_STAGE}"
+    clear_stage_done "${VERIFY_STAGE}"
+    {
+      printf '\n[信息] ===== 构建阶段开始 %s =====\n' "$(date +%Y%m%d_%H%M%S)"
+      (
+        cd "${SLIME_DIR}"
+        BASE_DIR="${BASE_DIR}" \
+        PATCH_VERSION="${PATCH_VERSION}" \
+        MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX}" \
+        TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
+        CUDA_DEVICE_MAX_CONNECTIONS=1 \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        SLIME_FAST_CLEAR_MEMORY=1 \
+        NCCL_NVLS_ENABLE=0 \
+        MAX_JOBS="${MAX_JOBS}" \
+        RESUME_DIR="${RESUME_DIR}" \
+        RESUME_ENABLED="${RESUME_ENABLED}" \
+        RETRY_ATTEMPTS="${RETRY_ATTEMPTS}" \
+        RETRY_DELAY_SECONDS="${RETRY_DELAY_SECONDS}" \
+        bash "${GENERATED_SCRIPT}"
+      )
+      printf '[信息] ===== 构建阶段完成 %s =====\n' "$(date +%Y%m%d_%H%M%S)"
+    } 2>&1 | tee -a "${BUILD_LOG}"
+    mark_stage_done "${BUILD_STAGE}"
+  fi
 else
   log "已按 --prepare-only 跳过实际构建。"
 fi
 
 # 构建完成后做完整导入验证，确认 Python 侧看到的是 cu126，并且运行在 A100/SM80 上。
 if [ "${RUN_VERIFY}" = "1" ]; then
-  log "开始验证 A100/CU126 环境。"
-  # shellcheck disable=SC1090
-  source "${ACTIVATE_FILE}"
-  log "验证使用 python=$(command -v python)"
-  python -V
-  log "CUDA_HOME=${CUDA_HOME:-}"
-  log "SLIME_ROOT=${SLIME_ROOT:-}"
-  log "PYTHONPATH=${PYTHONPATH:-}"
-  log "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-}"
-  log "CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-}"
-  log "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-}"
-  log "SLIME_FAST_CLEAR_MEMORY=${SLIME_FAST_CLEAR_MEMORY:-}"
-  log "NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-}"
-  python - <<'PY'
+  # 验证成功也写独立标识；已经通过的环境重复运行脚本时不用再枚举 GPU 和导入包。
+  if stage_done "${VERIFY_STAGE}" && [ "${FORCE_VERIFY}" != "1" ]; then
+    log "检测到验证完成标识，跳过验证阶段：$(stage_marker "${VERIFY_STAGE}")"
+  else
+    log "开始验证 A100/CU126 环境。"
+    clear_stage_done "${VERIFY_STAGE}"
+    # shellcheck disable=SC1090
+    source "${ACTIVATE_FILE}"
+    log "验证使用 python=$(command -v python)"
+    python -V
+    log "CUDA_HOME=${CUDA_HOME:-}"
+    log "SLIME_ROOT=${SLIME_ROOT:-}"
+    log "PYTHONPATH=${PYTHONPATH:-}"
+    log "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-}"
+    log "CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-}"
+    log "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-}"
+    log "SLIME_FAST_CLEAR_MEMORY=${SLIME_FAST_CLEAR_MEMORY:-}"
+    log "NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-}"
+    python - <<'PY'
 import importlib
 import os
 import sys
@@ -489,6 +735,8 @@ if errors:
 
 print("\nA100/CU126 环境验证全部通过。")
 PY
+    mark_stage_done "${VERIFY_STAGE}"
+  fi
 else
   log "已跳过验证。"
 fi

@@ -35,6 +35,8 @@ bash docker/build_a100_cu126.sh
 IMAGE_TAG=my-slime:a100-cu126 MAX_JOBS=16 bash docker/build_a100_cu126.sh
 ```
 
+裸机安装脚本支持断点续跑，完成标识默认写在 `${BASE_DIR}/.resume_a100_cu126`。网络中断或编译失败后重复运行同一条裸机安装命令即可；如需忽略断点重新构建或重新验证，可使用 `--force-build`、`--force-verify` 或 `--reset-resume`。Docker 构建仍遵循 Docker layer cache：已经成功提交的层会复用，但失败的长 `RUN` 层中的临时进度不保证保留。
+
 如果需要把镜像迁移到另一台机器，可以导出和导入：
 
 ```bash
