@@ -47,6 +47,7 @@ usage() {
   BUILD_LOG          默认 ${BASE_DIR}/build_cuda126.log
   RESUME_DIR         默认 ${BASE_DIR}/.resume_a100_cu126
   RESUME_ENABLED     默认 1；设为 0 时忽略断点标识
+  PIP_GIT_SOURCE_DIR 默认 ${BASE_DIR}/sources/pip_git；GitHub pip 包源码缓存
   RETRY_ATTEMPTS     默认 5；GitHub pip 安装失败时的最大重试次数
   RETRY_DELAY_SECONDS 默认 30；每次重试前等待秒数
 
@@ -151,6 +152,7 @@ BUILD_LOG="${BUILD_LOG:-${BASE_DIR}/build_cuda126.log}"
 INSTALL_LOG="${INSTALL_LOG:-${BASE_DIR}/install_a100_cu126_$(date +%Y%m%d_%H%M%S).log}"
 RESUME_DIR="${RESUME_DIR:-${BASE_DIR}/.resume_a100_cu126}"
 RESUME_ENABLED="${RESUME_ENABLED:-1}"
+PIP_GIT_SOURCE_DIR="${PIP_GIT_SOURCE_DIR:-${BASE_DIR}/sources/pip_git}"
 
 export BASE_DIR
 export ENV_NAME
@@ -161,6 +163,7 @@ export MAMBA_ROOT_PREFIX
 export MAMBA_EXE
 export RESUME_DIR
 export RESUME_ENABLED
+export PIP_GIT_SOURCE_DIR
 export RETRY_ATTEMPTS
 export RETRY_DELAY_SECONDS
 
@@ -229,6 +232,7 @@ log "RETRY_ATTEMPTS=${RETRY_ATTEMPTS}"
 log "RETRY_DELAY_SECONDS=${RETRY_DELAY_SECONDS}"
 log "RESUME_ENABLED=${RESUME_ENABLED}"
 log "RESUME_DIR=${RESUME_DIR}"
+log "PIP_GIT_SOURCE_DIR=${PIP_GIT_SOURCE_DIR}"
 log "INSTALL_LOG=${INSTALL_LOG}"
 log "BUILD_LOG=${BUILD_LOG}"
 
@@ -360,6 +364,7 @@ cp "${A100_BUILD_SCRIPT}" "${GENERATED_SCRIPT}"
 python3 - "${GENERATED_SCRIPT}" <<'PY'
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -375,6 +380,7 @@ resume_dir = os.environ["RESUME_DIR"]
 resume_enabled = os.environ["RESUME_ENABLED"]
 retry_attempts = os.environ["RETRY_ATTEMPTS"]
 retry_delay_seconds = os.environ["RETRY_DELAY_SECONDS"]
+pip_git_source_dir = os.environ["PIP_GIT_SOURCE_DIR"]
 
 # 将旧脚本中的系统级用户目录前缀统一改为当前用户的 BASE_DIR。
 old_root = "/" + "root"
@@ -444,12 +450,13 @@ export MAX_JOBS="${{MAX_JOBS:-32}}"
 export RESUME_DIR="${{RESUME_DIR:-{resume_dir}}}"
 export RESUME_ENABLED="${{RESUME_ENABLED:-{resume_enabled}}}"
 export GENERATED_RESUME_DIR="${{RESUME_DIR}}/generated"
+export PIP_GIT_SOURCE_DIR="${{PIP_GIT_SOURCE_DIR:-{pip_git_source_dir}}}"
 export RETRY_ATTEMPTS="${{RETRY_ATTEMPTS:-{retry_attempts}}}"
 export RETRY_DELAY_SECONDS="${{RETRY_DELAY_SECONDS:-{retry_delay_seconds}}}"
 export GIT_CONFIG_COUNT="${{GIT_CONFIG_COUNT:-1}}"
 export GIT_CONFIG_KEY_0="${{GIT_CONFIG_KEY_0:-http.version}}"
 export GIT_CONFIG_VALUE_0="${{GIT_CONFIG_VALUE_0:-HTTP/1.1}}"
-mkdir -p "${{GENERATED_RESUME_DIR}}"
+mkdir -p "${{GENERATED_RESUME_DIR}}" "${{PIP_GIT_SOURCE_DIR}}"
 
 # 返回生成脚本内部步骤的完成标识路径。
 generated_stage_marker() {{
@@ -508,6 +515,46 @@ retry_command() {{
     attempt="$((attempt + 1))"
   done
 }}
+
+# 先把 GitHub 源码包拉到持久目录，再从本地目录安装，避免 pip 每次都在 /tmp 重新 clone。
+install_github_package() {{
+  local git_url="$1"
+  local git_ref="$2"
+  local local_name="$3"
+  local src_dir="${{PIP_GIT_SOURCE_DIR}}/${{local_name}}"
+  local tmp_dir="${{src_dir}}.tmp.$$"
+  local status=0
+  shift 3
+
+  # 已有 git 目录时复用并 fetch；例如 `git+https://github.com/a/b.git@sha` 会复用 `${{PIP_GIT_SOURCE_DIR}}/a__b`。
+  if [ -d "${{src_dir}}/.git" ]; then
+    echo "[信息] 复用 GitHub 源码目录：${{src_dir}}"
+    retry_command git -C "${{src_dir}}" fetch --all --tags || return "$?"
+  elif [ -e "${{src_dir}}" ]; then
+    echo "[错误] ${{src_dir}} 已存在但不是 git 仓库，请人工检查后再重跑。" >&2
+    return 1
+  else
+    echo "[信息] 克隆 GitHub 源码：${{git_url}} -> ${{src_dir}}"
+    retry_command git clone "${{git_url}}" "${{tmp_dir}}" || return "$?"
+    mv "${{tmp_dir}}" "${{src_dir}}" || return "$?"
+  fi
+
+  # 对固定 commit 或 tag 再单独 fetch 一次；若对象已经存在，则允许继续 checkout。
+  if ! retry_command git -C "${{src_dir}}" fetch origin "${{git_ref}}"; then
+    git -C "${{src_dir}}" rev-parse --verify "${{git_ref}}^{{commit}}" >/dev/null 2>&1 || return "$?"
+  fi
+  git -C "${{src_dir}}" checkout -f "${{git_ref}}" || return "$?"
+
+  # 有子模块时一并更新，避免本地安装阶段才发现源码不完整。
+  if [ -f "${{src_dir}}/.gitmodules" ]; then
+    retry_command git -C "${{src_dir}}" submodule update --init --recursive || return "$?"
+  fi
+
+  # 将原始 pip 参数保留下来，只把 git+URL 替换成本地源码目录。
+  "$@" "${{src_dir}}"
+  status="$?"
+  return "${{status}}"
+}}
 '''
 if marker not in text:
     text = text.replace("set -ex", injected, 1)
@@ -538,27 +585,42 @@ text = text.replace("git checkout ${MEGATRON_COMMIT}", "git checkout -f ${MEGATR
 text = re.sub(r"SLIME_ENV_SH=/etc/profile\.d/slime_env\.sh", 'SLIME_ENV_SH="${BASE_DIR}/slime_env.sh"', text)
 text = re.sub(r'RC_FILES="[^"]*"', 'RC_FILES="${BASE_DIR}/.bashrc"', text)
 
-# 将 GitHub 源码 pip 安装改为“断点步骤 + 重试”版本。
+# 将 GitHub 源码 pip 安装改为“先 clone 到持久目录，再从本地安装”的断点步骤。
 def github_pip_stage(command: str) -> str:
     """把 pip GitHub 安装命令转成稳定的阶段名。"""
     key = re.sub(r"[^A-Za-z0-9]+", "_", command).strip("_").lower()
     return "pip_github_" + key[:96]
 
 
+def parse_github_spec(spec: str) -> tuple[str, str, str]:
+    """把 git+https 规格拆成 git URL、ref 和本地目录名。"""
+    raw = spec.removeprefix("git+")
+    if "@" in raw:
+        git_url, git_ref = raw.rsplit("@", 1)
+    else:
+        git_url, git_ref = raw, "HEAD"
+    repo_path = re.sub(r"^https://github\.com/", "", git_url).removesuffix(".git")
+    # 将 `https://github.com/fzyzcjy/torch_memory_saver.git@sha` 转成目录名 `fzyzcjy__torch_memory_saver`。
+    local_name = re.sub(r"[^A-Za-z0-9._-]+", "_", repo_path.replace("/", "__")).strip("_")
+    return git_url, git_ref, local_name
+
+
 def wrap_github_pip(match: re.Match[str]) -> str:
-    """把 `pip install git+https://github.com/...` 包成可重试、可跳过步骤。"""
+    """把 `pip install git+https://github.com/...` 改成本地源码安装。"""
     indent = match.group(1)
     command = match.group(2)
-    return f"{indent}run_generated_step {github_pip_stage(command)} retry_command {command}"
+    parts = shlex.split(command)
+    git_index = next((idx for idx, part in enumerate(parts) if part.startswith("git+https://github.com/")), -1)
+    if git_index < 0:
+        return match.group(0)
+    git_url, git_ref, local_name = parse_github_spec(parts[git_index])
+    pip_parts = parts[:git_index] + parts[git_index + 1 :]
+    quoted = " ".join(shlex.quote(part) for part in [git_url, git_ref, local_name, *pip_parts])
+    return f"{indent}run_generated_step {github_pip_stage(command)} install_github_package {quoted}"
 
 
 text = re.sub(
-    r"(?m)^(\s*)(pip install git\+https://github\.com/[^\n]+)$",
-    wrap_github_pip,
-    text,
-)
-text = re.sub(
-    r"(?m)^(\s*)(python -m pip install git\+https://github\.com/[^\n]+)$",
+    r"(?m)^(\s*)((?:python -m )?pip install [^\n]*git\+https://github\.com/[^\n]+)$",
     wrap_github_pip,
     text,
 )
