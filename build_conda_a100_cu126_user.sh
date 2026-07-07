@@ -40,6 +40,8 @@ usage() {
   TORCH_CUDA_ARCH_LIST 默认 8.0
   REUSE_ROOT_EXISTING 默认 1；设为 0 时不复用 /root 下的已有资源
   ROOT_BASE_DIR      默认 /root；用于查找可复用的系统级资源
+  INSTALL_LOG        默认 ${BASE_DIR}/install_a100_cu126_<时间戳>.log
+  BUILD_LOG          默认 ${BASE_DIR}/build_cuda126.log
 
 示例:
   bash build_conda_a100_cu126_user.sh
@@ -122,6 +124,7 @@ MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-${BASE_DIR}/micromamba}"
 GENERATED_SCRIPT="${GENERATED_SCRIPT:-${SLIME_DIR}/build_conda.a100.cuda126.user.sh}"
 ACTIVATE_FILE="${ACTIVATE_FILE:-${BASE_DIR}/activate_slime_a100_cu126.sh}"
 BUILD_LOG="${BUILD_LOG:-${BASE_DIR}/build_cuda126.log}"
+INSTALL_LOG="${INSTALL_LOG:-${BASE_DIR}/install_a100_cu126_$(date +%Y%m%d_%H%M%S).log}"
 
 export BASE_DIR
 export ENV_NAME
@@ -131,12 +134,19 @@ export MAX_JOBS
 export MAMBA_ROOT_PREFIX
 export MAMBA_EXE
 
+# 从这里开始记录完整安装过程：既实时打印到终端，也写入总日志文件。
+touch "${INSTALL_LOG}" || die "无法写入安装日志：${INSTALL_LOG}"
+exec > >(tee -a "${INSTALL_LOG}") 2>&1
+trap 'status=$?; if [ "${status}" -ne 0 ]; then printf "[错误] 脚本异常退出，退出码=%s；请查看安装日志：%s\n" "${status}" "${INSTALL_LOG}" >&2; fi' EXIT
+
 log "BASE_DIR=${BASE_DIR}"
 log "SLIME_DIR=${SLIME_DIR}"
 log "ENV_NAME=${ENV_NAME}"
 log "PATCH_VERSION=${PATCH_VERSION}"
 log "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
 log "REUSE_ROOT_EXISTING=${REUSE_ROOT_EXISTING}"
+log "INSTALL_LOG=${INSTALL_LOG}"
+log "BUILD_LOG=${BUILD_LOG}"
 
 # A100 是 SM80；这里给出提醒，不强制检查 GPU，方便在登录节点先生成脚本。
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -390,35 +400,99 @@ else
   log "已按 --prepare-only 跳过实际构建。"
 fi
 
-# 构建完成后做轻量导入验证，确认 Python 侧看到的是 cu126。
+# 构建完成后做完整导入验证，确认 Python 侧看到的是 cu126，并且运行在 A100/SM80 上。
 if [ "${RUN_VERIFY}" = "1" ]; then
   log "开始验证 A100/CU126 环境。"
   # shellcheck disable=SC1090
   source "${ACTIVATE_FILE}"
+  log "验证使用 python=$(command -v python)"
+  python -V
+  log "CUDA_HOME=${CUDA_HOME:-}"
+  log "SLIME_ROOT=${SLIME_ROOT:-}"
+  log "PYTHONPATH=${PYTHONPATH:-}"
+  log "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-}"
+  log "CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-}"
+  log "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-}"
+  log "SLIME_FAST_CLEAR_MEMORY=${SLIME_FAST_CLEAR_MEMORY:-}"
+  log "NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-}"
   python - <<'PY'
+import importlib
+import os
+import sys
+
 import torch
+
+errors: list[str] = []
+
+
+def check(condition: bool, message: str) -> None:
+    if condition:
+        print(f"[通过] {message}")
+    else:
+        print(f"[失败] {message}")
+        errors.append(message)
+
 
 print("torch:", torch.__version__)
 print("torch CUDA:", torch.version.cuda)
 print("cuda available:", torch.cuda.is_available())
+check(torch.version.cuda is not None and torch.version.cuda.startswith("12.6"), "PyTorch 使用 CUDA 12.6")
+check(torch.cuda.is_available(), "PyTorch 可以访问 CUDA GPU")
+
+has_a100 = False
 if torch.cuda.is_available():
-    print("gpu:", torch.cuda.get_device_name(0))
+    device_count = torch.cuda.device_count()
+    print("gpu count:", device_count)
+    for idx in range(device_count):
+        name = torch.cuda.get_device_name(idx)
+        capability = torch.cuda.get_device_capability(idx)
+        print(f"gpu[{idx}]: {name}, capability={capability}")
+        if "A100" in name and capability == (8, 0):
+            has_a100 = True
+check(has_a100, "至少检测到一张 NVIDIA A100 / SM80 GPU")
 
-import transformer_engine
-print("Transformer Engine:", transformer_engine.__version__)
+expected_env = {
+    "TORCH_CUDA_ARCH_LIST": "8.0",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "SLIME_FAST_CLEAR_MEMORY": "1",
+    "NCCL_NVLS_ENABLE": "0",
+}
+for key, expected in expected_env.items():
+    actual = os.environ.get(key)
+    print(f"{key}={actual}")
+    check(actual == expected, f"{key}={expected}")
 
-import sglang
-print("SGLang OK")
+for module_name in ("slime", "sglang", "transformer_engine", "deep_ep", "megatron"):
+    try:
+        module = importlib.import_module(module_name)
+        version = getattr(module, "__version__", "unknown")
+        print(f"[通过] {module_name} 导入成功，version={version}")
+    except Exception as exc:
+        print(f"[失败] {module_name} 导入失败: {exc!r}")
+        errors.append(f"{module_name} 导入失败")
 
 try:
-    import deep_ep
-    print("DeepEP OK")
+    router = importlib.import_module("sglang_router")
+    router_version = getattr(router, "__version__", "unknown")
+    print(f"sglang_router version={router_version}")
+    check("slime" in str(router_version), "sglang_router 版本包含 slime 标识")
 except Exception as exc:
-    print("DeepEP 导入失败，请检查 A100 patch 和构建日志:", repr(exc))
-    raise
+    print(f"[失败] sglang_router 导入失败: {exc!r}")
+    errors.append("sglang_router 导入失败")
+
+if errors:
+    print("\n验证失败项:")
+    for item in errors:
+        print(f"- {item}")
+    sys.exit(1)
+
+print("\nA100/CU126 环境验证全部通过。")
 PY
 else
   log "已跳过验证。"
 fi
 
 log "完成。后续使用环境前执行：source ${ACTIVATE_FILE}"
+log "总安装日志：${INSTALL_LOG}"
+log "构建子日志：${BUILD_LOG}"
