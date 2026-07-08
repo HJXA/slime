@@ -413,7 +413,7 @@ text = text.replace(
 
 # 环境名从默认 slime 改为独立名称，避免覆盖已有环境。
 text = re.sub(r"micromamba create -n slime\b", f"micromamba create -n {env_name}", text)
-text = re.sub(r"micromamba activate slime\b", f"micromamba activate {env_name}", text)
+text = re.sub(r"micromamba activate slime\b", f"activate_micromamba_env {env_name}", text)
 text = re.sub(r"micromamba install -n slime\b", f"micromamba install -n {env_name}", text)
 text = text.replace("envs/slime", f"envs/{env_name}")
 
@@ -457,6 +457,34 @@ export GIT_CONFIG_COUNT="${{GIT_CONFIG_COUNT:-1}}"
 export GIT_CONFIG_KEY_0="${{GIT_CONFIG_KEY_0:-http.version}}"
 export GIT_CONFIG_VALUE_0="${{GIT_CONFIG_VALUE_0:-HTTP/1.1}}"
 mkdir -p "${{GENERATED_RESUME_DIR}}" "${{PIP_GIT_SOURCE_DIR}}"
+
+# 激活 conda/micromamba 环境时临时关闭 nounset，避免 activate.d 脚本读取未定义变量。
+activate_micromamba_env() {{
+  local env_name="$1"
+  local had_nounset=0
+  local status=0
+
+  # 记录调用方是否开启 set -u；例如 gcc_linux 激活脚本会读取未设置的 SYS_SYSROOT。
+  case "$-" in
+    *u*)
+      had_nounset=1
+      set +u
+      ;;
+  esac
+
+  # 用 if 捕获激活状态，避免 set -e 在恢复 nounset 前直接退出。
+  if micromamba activate "${{env_name}}"; then
+    status=0
+  else
+    status="$?"
+  fi
+
+  # 恢复调用方原本的 nounset 状态，避免改变后续脚本约束。
+  if [ "${{had_nounset}}" = "1" ]; then
+    set -u
+  fi
+  return "${{status}}"
+}}
 
 # 返回生成脚本内部步骤的完成标识路径。
 generated_stage_marker() {{
@@ -652,7 +680,36 @@ export BASE_DIR="${BASE_DIR}"
 export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX}"
 export PATH="$(dirname "${MAMBA_EXE}"):\${PATH}"
 eval "\$("${MAMBA_EXE}" shell hook -s bash)"
-micromamba activate "${ENV_NAME}"
+
+# 激活 conda/micromamba 环境时临时关闭 nounset，避免 activate.d 脚本读取未定义变量。
+_slime_activate_micromamba() {
+  local env_name="\$1"
+  local had_nounset=0
+  local status=0
+
+  # 记录调用方是否开启 set -u；例如 gcc_linux 激活脚本会读取未设置的 SYS_SYSROOT。
+  case "\$-" in
+    *u*)
+      had_nounset=1
+      set +u
+      ;;
+  esac
+
+  # 用 if 捕获激活状态，避免 set -e 在恢复 nounset 前直接退出。
+  if micromamba activate "\${env_name}"; then
+    status=0
+  else
+    status="\$?"
+  fi
+
+  # 恢复调用方原本的 nounset 状态，避免改变后续脚本约束。
+  if [ "\${had_nounset}" = "1" ]; then
+    set -u
+  fi
+  return "\${status}"
+}
+
+_slime_activate_micromamba "${ENV_NAME}"
 export CUDA_HOME="\${CONDA_PREFIX}"
 export SLIME_ROOT="${SLIME_DIR}"
 export PYTHONPATH="${BASE_DIR}/Megatron-LM:\${PYTHONPATH:-}"
